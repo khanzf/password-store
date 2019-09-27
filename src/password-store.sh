@@ -246,7 +246,7 @@ BASE64="base64"
 get_current_entry() {
 	path=$1
 	$GPG -d "${GPG_OPTS[@]}" -o $PREFIX/index.map $PREFIX/index.gpg
-	entry=$(grep "^$path " $PREFIX/index.map)
+	obfuscatedprefix=$(grep "^$path " $PREFIX/index.map | awk '{print $2}')
 }
 
 get_obfuscated_prefix() {
@@ -391,7 +391,7 @@ cmd_show() {
 	local obfuscatedpath
 
 	get_current_entry $path
-	read _unused_path obfuscatedprefix < <(echo "$entry")
+	rm $PREFIX/index.map
 
 	local passfile="$PREFIX/$obfuscatedprefix.gpg"
 	check_sneaky_paths "$path"
@@ -415,7 +415,7 @@ cmd_show() {
 		else
 			echo "${path%\/}"
 		fi
-		$GPG -d "${GPG_OPTS[@]}" $PREFIX/$path/index.gpg 2> /dev/null
+		$GPG -d "${GPG_OPTS[@]}" $PREFIX/$path/index.gpg 2> /dev/null | awk '{print $1}'
 	elif [[ -z $path ]]; then
 		die "Error: password store is empty. Try \"pass init\"."
 	else
@@ -505,10 +505,10 @@ cmd_edit() {
 	set_git "$passfile"
 
 	get_current_entry $path
-	if [ -z "$entry" ]; then
+	local newfile=false
+	if [ -z "$obfuscatedprefix" ]; then
 		get_obfuscated_prefix
-	else
-		read _unused_path obfuscatedprefix < <(echo "$entry")
+		newfile=true
 	fi
 
 	local passfile="$PREFIX/$obfuscatedprefix.gpg"
@@ -530,7 +530,7 @@ cmd_edit() {
 		yesno "GPG encryption failed. Would you like to try again?"
 	done
 
-	if [ -z "$entry" ]; then
+	if [ $newfile = true ]; then
 		echo $path $obfuscatedprefix >> $PREFIX/index.map
 		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" "${GPG_OPTS[@]}" -o $PREFIX/index.gpg $PREFIX/index.map
 	fi
@@ -565,9 +565,8 @@ cmd_generate() {
 
 
 	get_current_entry $path
-	if [ ! -z "$entry" ]; then
+	if [ ! -z "$obfuscatedprefix" ]; then
 		[[ $inplace -eq 0 && $force -eq 0 ]] && yesno "An entry already exists for $path. Overwrite it?"
-		read _unused_path obfuscatedprefix < <(echo "$entry")
 		rm $PREFIX/$obfuscatedprefix.gpg
 #		sed -i.bak "/^$path /d" $PREFIX/index.map
 #		rm $PREFIX/index.map.bak
@@ -623,10 +622,9 @@ cmd_delete() {
 	check_sneaky_paths "$path"
 
 	get_current_entry $path
-	if [ -z "$entry" ]; then
+	if [ -z "$obfuscatedprefix" ]; then
 		die "Error: $path is not in the password store."
 	fi
-	read _unused_path obfuscatedprefix < <(echo "$entry")
 
 #	local passdir="$PREFIX/${path%/}"
 	local passfile="$PREFIX/$obfuscatedprefix.gpg"
