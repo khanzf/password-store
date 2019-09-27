@@ -243,6 +243,16 @@ GETOPT="getopt"
 SHRED="shred -f -z"
 BASE64="base64"
 
+get_current_entry() {
+	path=$1
+	$GPG -d "${GPG_OPTS[@]}" -o $PREFIX/index.map $PREFIX/index.gpg
+	entry=$(grep "^$path " $PREFIX/index.map)
+}
+
+get_obfuscated_prefix() {
+	obfuscatedprefix=$(cat /dev/urandom | tr -cd 'a-f0-9' | head -c 32)
+}
+
 source "$(dirname "$0")/platform/$(uname | cut -d _ -f 1 | tr '[:upper:]' '[:lower:]').sh" 2>/dev/null # PLATFORM_FUNCTION_FILE
 
 #
@@ -344,6 +354,7 @@ cmd_init() {
 		mkdir -v -p "$PREFIX/$id_path"
 		printf "%s\n" "$@" > "$gpg_id"
 		local id_print="$(printf "%s, " "$@")"
+		printf "" | $GPG -e -r ${id_print%, }${id_path:+ ($id_path)} -o $PREFIX/index.gpg 2> /dev/null
 		echo "Password store initialized for ${id_print%, }${id_path:+ ($id_path)}"
 		git_add_file "$gpg_id" "Set GPG id to ${id_print%, }${id_path:+ ($id_path)}."
 		if [[ -n $PASSWORD_STORE_SIGNING_KEY ]]; then
@@ -377,7 +388,12 @@ cmd_show() {
 
 	local pass
 	local path="$1"
-	local passfile="$PREFIX/$path.gpg"
+	local obfuscatedpath
+
+	get_current_entry $path
+	read _unused_path obfuscatedprefix < <(echo "$entry")
+
+	local passfile="$PREFIX/$obfuscatedprefix.gpg"
 	check_sneaky_paths "$path"
 	if [[ -f $passfile ]]; then
 		if [[ $clip -eq 0 && $qrcode -eq 0 ]]; then
@@ -399,7 +415,7 @@ cmd_show() {
 		else
 			echo "${path%\/}"
 		fi
-		tree -C -l --noreport "$PREFIX/$path" | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' # remove .gpg at end of line, but keep colors
+		$GPG -d "${GPG_OPTS[@]}" $PREFIX/$path/index.gpg 2> /dev/null
 	elif [[ -z $path ]]; then
 		die "Error: password store is empty. Try \"pass init\"."
 	else
@@ -486,8 +502,17 @@ cmd_edit() {
 	check_sneaky_paths "$path"
 	mkdir -p -v "$PREFIX/$(dirname -- "$path")"
 	set_gpg_recipients "$(dirname -- "$path")"
-	local passfile="$PREFIX/$path.gpg"
 	set_git "$passfile"
+
+	get_current_entry $path
+	if [ -z "$entry" ]; then
+		get_obfuscated_prefix
+	else
+		read _unused_path obfuscatedprefix < <(echo "$entry")
+	fi
+
+	local passfile="$PREFIX/$obfuscatedprefix.gpg"
+	local clearfile="$PREFIX/$obfuscatedprefix"
 
 	tmpdir #Defines $SECURE_TMPDIR
 	local tmp_file="$(mktemp -u "$SECURE_TMPDIR/XXXXXX")-${path//\//-}.txt"
@@ -497,12 +522,21 @@ cmd_edit() {
 		$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$passfile" || exit 1
 		action="Edit"
 	fi
+
 	${EDITOR:-vi} "$tmp_file"
 	[[ -f $tmp_file ]] || die "New password not saved."
-	$GPG -d -o - "${GPG_OPTS[@]}" "$passfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Password unchanged."
+	$GPG -d -o - "${GPG_OPTS[@]}" "$passfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && rm $PREFIX/index.map | die "Password unchanged."
 	while ! $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" "$tmp_file"; do
 		yesno "GPG encryption failed. Would you like to try again?"
 	done
+
+	if [ -z "$entry" ]; then
+		echo $path $obfuscatedprefix >> $PREFIX/index.map
+		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" "${GPG_OPTS[@]}" -o $PREFIX/index.gpg $PREFIX/index.map
+	fi
+
+	rm $PREFIX/index.map
+
 	git_add_file "$passfile" "$action password for $path using ${EDITOR:-vi}."
 }
 
@@ -528,10 +562,25 @@ cmd_generate() {
 	[[ $length -gt 0 ]] || die "Error: pass-length must be greater than zero."
 	mkdir -p -v "$PREFIX/$(dirname -- "$path")"
 	set_gpg_recipients "$(dirname -- "$path")"
-	local passfile="$PREFIX/$path.gpg"
-	set_git "$passfile"
 
-	[[ $inplace -eq 0 && $force -eq 0 && -e $passfile ]] && yesno "An entry already exists for $path. Overwrite it?"
+
+	get_current_entry $path
+	if [ ! -z "$entry" ]; then
+		[[ $inplace -eq 0 && $force -eq 0 ]] && yesno "An entry already exists for $path. Overwrite it?"
+		read _unused_path obfuscatedprefix < <(echo "$entry")
+		rm $PREFIX/$obfuscatedprefix.gpg
+#		sed -i.bak "/^$path /d" $PREFIX/index.map
+#		rm $PREFIX/index.map.bak
+	else
+		get_obfuscated_prefix
+		echo $path $obfuscatedprefix >> $PREFIX/index.map
+		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" "${GPG_OPTS[@]}" -o $PREFIX/index.gpg $PREFIX/index.map
+	fi
+
+	rm $PREFIX/index.map
+
+	local passfile="$PREFIX/$obfuscatedprefix.gpg"
+	set_git "$passfile"
 
 	read -r -n $length pass < <(LC_ALL=C tr -dc "$characters" < /dev/urandom)
 	[[ ${#pass} -eq $length ]] || die "Could not generate password from /dev/urandom."
@@ -573,15 +622,25 @@ cmd_delete() {
 	local path="$1"
 	check_sneaky_paths "$path"
 
-	local passdir="$PREFIX/${path%/}"
-	local passfile="$PREFIX/$path.gpg"
-	[[ -f $passfile && -d $passdir && $path == */ || ! -f $passfile ]] && passfile="${passdir%/}/"
+	get_current_entry $path
+	if [ -z "$entry" ]; then
+		die "Error: $path is not in the password store."
+	fi
+	read _unused_path obfuscatedprefix < <(echo "$entry")
+
+#	local passdir="$PREFIX/${path%/}"
+	local passfile="$PREFIX/$obfuscatedprefix.gpg"
+	[[ -f $passfile && -d $passdir && $path == */ || ! -f $passfile ]]
 	[[ -e $passfile ]] || die "Error: $path is not in the password store."
 	set_git "$passfile"
 
 	[[ $force -eq 1 ]] || yesno "Are you sure you would like to delete $path?"
 
-	rm $recursive -f -v "$passfile"
+	sed -i.bak "/^$path /d" $PREFIX/index.map
+	$GPG -e -r farhan@farhan.codes "${GPG_RECIPIENT_ARGS[@]}" -o $PREFIX/index.gpg $PREFIX/index.map
+	exit
+
+	rm $recursive -f -v "$passfile" $PREFIX/index.map $PREFIX/index.map.bak
 	set_git "$passfile"
 	if [[ -n $INNER_GIT_DIR && ! -e $passfile ]]; then
 		git -C "$INNER_GIT_DIR" rm -qr "$passfile"
